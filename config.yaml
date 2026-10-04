@@ -1,0 +1,39 @@
+# GitLab Migration Configuration
+# Fill in real values before running. Tokens should be admin/root tokens with `api` scope.
+
+legacy:
+  url: "https://old-gitlab.example.com"   # legacy GitLab base URL - CHANGE THIS
+  token: "CHANGE_ME"                      # set via env var GITLAB_LEGACY_TOKEN instead if possible
+
+new:
+  url: "https://new-gitlab.example.com"   # new GitLab base URL - CHANGE THIS
+  token: "CHANGE_ME"                      # set via env var GITLAB_NEW_TOKEN instead if possible
+
+options:
+  dry_run: true          # if true, prints planned actions without making changes
+  skip_users: false
+  skip_groups: false
+  skip_membership: false
+  skip_projects: false
+  skip_mirror: false
+  skip_project_members: false
+  skip_webhooks: false
+  skip_protected_branches: false
+
+  # temp password assigned to recreated users (they should reset on first login)
+  temp_password: "ChangeMe123!"
+  force_password_reset: true
+
+  # parallelism for mirror push step
+  mirror_parallel_jobs: 4
+
+  # where to scratch-clone repos during mirror push (cleaned up after each repo)
+  mirror_work_dir: "/tmp/gitlab-migration-mirror"
+
+# Optional: restrict migration to specific project paths (leave empty list to migrate all)
+project_allowlist: []
+
+# Optional: users to skip entirely (e.g. bot accounts, ghost users)
+user_skiplist:
+  - "ghost"
+  - "support-bot"

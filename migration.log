@@ -1,0 +1,5 @@
+[2026-09-27 05:59:04] [WARN] User 'bob' marked done in state but missing on new — will re-add
+[2026-09-27 05:59:04] [WARN] Group 'g' marked done in state but missing on new — will re-add
+[2026-09-27 05:59:04] [WARN] Project 'g/p' has new branch(es) ['feature'] on legacy not on new — will re-mirror (force-push!)
+[2026-09-27 05:59:04] [WARN] Project 'g/gone' marked done in state but missing on new — will re-create + re-mirror
+[2026-09-27 06:16:27] [WARN] Project 'g/p' has new branch(es) ['feature'] on legacy not on new — will re-mirror (force-push!)
