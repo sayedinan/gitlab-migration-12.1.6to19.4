@@ -137,7 +137,7 @@ def check_projects_and_content(legacy, new, report, allowlist, work_dir, legacy_
         # (should never happen) or a legacy project with MRs that got none migrated
         # at all when it shouldn't be zero - that ambiguity is left to a human to read
         # from the detail string rather than guessed at here.
-        ok = len(new_mrs) <= len(legacy_mrs)
+        ok = len(new_mrs) == len(legacy_mrs)
         detail = f"legacy={len(legacy_mrs)} new={len(new_mrs)}"
         if len(new_mrs) < len(legacy_mrs):
             detail += " (fewer is OK if some source branches were already deleted on legacy)"
@@ -175,6 +175,63 @@ def _remote_commit_count(auth_url, branch, work_dir):
         return int(result.stdout.strip())
 
 
+def _count_comments(api, pid):
+    n = 0
+    for kind in ("issues", "merge_requests"):
+        for it in api.get_all(f"/projects/{pid}/{kind}", {"scope": "all"}):
+            n += sum(1 for x in api.get_all(f"/projects/{pid}/{kind}/{it['iid']}/notes") if not x.get("system"))
+    return n
+
+
+def _all_as(api, path, sudo):
+    out, page = [], 1
+    while True:
+        r = api.session.get(f"{api.base_url}{path}", params={"per_page": 100, "page": page}, headers={"Sudo": sudo})
+        if r.status_code != 200 or not r.json():
+            return out
+        out += r.json()
+        if len(r.json()) < 100:
+            return out
+        page += 1
+
+
+def check_extras(legacy, new, report, allowlist, skiplist):
+    q = lambda p: requests.utils.quote(p, safe="")
+    for lp in legacy.get_all("/projects", params={"membership": False}):
+        path = lp["path_with_namespace"]
+        if allowlist and path not in allowlist:
+            continue
+        np_ = new.get(f"/projects/{q(path)}")
+        if not np_:
+            continue
+        lc, nc = _count_comments(legacy, lp["id"]), _count_comments(new, np_["id"])
+        report.add(f"  Comments: {path}", lc == nc, f"legacy={lc} new={nc}")
+        for kind, field in (("milestones", "title"), ("labels", "name")):
+            ls = {x[field] for x in legacy.get_all(f"/projects/{lp['id']}/{kind}", {"state": "all"} if kind == "milestones" else None)}
+            ns = {x[field] for x in new.get_all(f"/projects/{np_['id']}/{kind}", {"state": "all"} if kind == "milestones" else None)}
+            report.add(f"  {kind.title()}: {path}", ls <= ns, f"missing: {sorted(ls - ns)}" if ls - ns else f"{len(ls)} present")
+        ls = len(legacy.get_all(f"/projects/{lp['id']}/snippets"))
+        ns = len(new.get_all(f"/projects/{np_['id']}/snippets"))
+        report.add(f"  Project snippets: {path}", ls == ns, f"legacy={ls} new={ns}")
+        if lp.get("forked_from_project"):
+            report.add(f"  Fork link: {path}", bool(np_.get("forked_from_project")),
+                       f"should be a fork of {lp['forked_from_project']['path_with_namespace']}")
+    for u in legacy.get_all("/users"):
+        name = u["username"]
+        if name in skiplist:
+            continue
+        nu = new.get_all("/users", params={"username": name})
+        if not nu:
+            continue
+        lk = len(legacy.get_all(f"/users/{u['id']}/keys"))
+        nk = len(new.get_all(f"/users/{nu[0]['id']}/keys"))
+        if lk or nk:
+            report.add(f"  SSH keys: {name}", lk == nk, f"legacy={lk} new={nk}")
+        lsn, nsn = len(_all_as(legacy, "/snippets", name)), len(_all_as(new, "/snippets", name))
+        if lsn or nsn:
+            report.add(f"  Personal snippets: {name}", lsn == nsn, f"legacy={lsn} new={nsn}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config.yaml")
@@ -208,6 +265,9 @@ def main():
         legacy, new, report, allowlist, work_dir,
         cfg["legacy"]["url"], cfg["legacy"]["token"], cfg["new"]["url"], cfg["new"]["token"],
     )
+
+    print("\n=== Extras: comments, labels, milestones, snippets, SSH keys, forks ===")
+    check_extras(legacy, new, report, allowlist, skiplist)
 
     ok = report.summary()
     sys.exit(0 if ok else 1)

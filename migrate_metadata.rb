@@ -92,6 +92,25 @@ end
 # Called AFTER the issue/MR is created and recorded in the state file, inside its
 # own rescue, so a failure here only logs a warning - it can never cause a
 # duplicate issue/MR on re-run.
+def find_label(project, name)
+  project.labels.find_by(title: name) ||
+    (project.group && Label.where(group_id: project.group.self_and_ancestors.select(:id), title: name).first)
+end
+
+def find_milestone(project, title)
+  project.milestones.find_by(title: title) ||
+    (project.group && Milestone.where(group_id: project.group.self_and_ancestors.select(:id), title: title).first)
+end
+
+def apply_labels_and_milestone(obj, project, legacy_obj)
+  labels = (legacy_obj["labels"] || []).map { |n| find_label(project, n) }.compact
+  obj.labels = labels unless labels.empty?
+  if legacy_obj["milestone"]
+    ms = find_milestone(project, legacy_obj.dig("milestone", "title"))
+    obj.update_columns(milestone_id: ms.id) if ms
+  end
+end
+
 def enrich_issue(issue, li, cache)
   updates = {}
   if li["state"] == "closed"
@@ -102,6 +121,7 @@ def enrich_issue(issue, li, cache)
   issue.update_columns(updates) unless updates.empty?
   assignees = (li["assignees"] || []).map { |a| find_user(a["username"], cache) }.compact
   issue.assignees = assignees unless assignees.empty?
+  apply_labels_and_milestone(issue, issue.project, li)
 end
 
 def enrich_mr(mr, lm, cache)
@@ -118,6 +138,7 @@ def enrich_mr(mr, lm, cache)
   mr.metrics.update_columns(attrs) if attrs.any? && mr.metrics
   assignees = (lm["assignees"] || []).map { |a| find_user(a["username"], cache) }.compact
   mr.assignees = assignees unless assignees.empty?
+  apply_labels_and_milestone(mr, mr.target_project, lm)
 end
 
 legacy_projects = legacy_get("/projects", { membership: false })
@@ -231,10 +252,23 @@ legacy_projects.each do |lp|
       next
     end
 
-    branch_names = project.repository.branch_names
-    unless branch_names.include?(lm["source_branch"]) && branch_names.include?(lm["target_branch"])
-      log("MR #{key} references missing branch(es) (#{lm['source_branch']} -> #{lm['target_branch']}), skipping", "WARN")
+    unless project.repository.branch_exists?(lm["target_branch"])
+      log("MR #{key}: target branch #{lm['target_branch']} missing, skipping", "WARN")
       next
+    end
+
+    temp_branch = false
+    if !state["mrs"][key] && !project.repository.branch_exists?(lm["source_branch"])
+      sha = [lm["sha"], lm.dig("diff_refs", "head_sha"), lm["merge_commit_sha"], lm["squash_commit_sha"]]
+              .compact.find { |s| project.repository.commit(s) }
+      sha ||= project.repository.commit(lm["target_branch"])&.sha # last resort: MR shows an empty diff
+      if DRY_RUN
+        log("[DRY RUN] MR #{key}: source branch missing, would recreate it temporarily")
+      else
+        project.repository.add_branch(author, lm["source_branch"], sha)
+        temp_branch = true
+        log("MR #{key}: recreated missing source branch #{lm['source_branch']} temporarily")
+      end
     end
 
     if DRY_RUN
@@ -275,6 +309,14 @@ legacy_projects.each do |lp|
       rescue => e
         log("Failed to create MR #{key}: #{e.message}", "ERROR")
         next
+      end
+    end
+
+    if temp_branch && lm["state"] != "opened"
+      begin
+        project.repository.rm_branch(author, lm["source_branch"])
+      rescue => e
+        log("Could not remove temporary branch #{lm['source_branch']}: #{e.message}", "WARN")
       end
     end
 

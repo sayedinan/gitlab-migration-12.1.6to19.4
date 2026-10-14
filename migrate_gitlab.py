@@ -269,6 +269,10 @@ def migrate_projects(legacy: GitLabAPI, new: GitLabAPI, cfg, state: State, dry_r
         path_with_namespace = p["path_with_namespace"]
         if allowlist and path_with_namespace not in allowlist:
             continue
+        up = p.get("forked_from_project")
+        if up and (not allowlist or up["path_with_namespace"] in allowlist):
+            log(f"{path_with_namespace} is a fork of {up['path_with_namespace']} - created in the forks step")
+            continue
         if state.is_done("projects", path_with_namespace):
             log(f"Project {path_with_namespace} already migrated, skipping")
             continue
@@ -440,6 +444,8 @@ def migrate_mirror(legacy: GitLabAPI, new: GitLabAPI, cfg, state: State, dry_run
         path_with_namespace = p["path_with_namespace"]
         if allowlist and path_with_namespace not in allowlist:
             continue
+        if p.get("forked_from_project") and (not allowlist or p["forked_from_project"]["path_with_namespace"] in allowlist):
+            continue
         if state.is_done("mirrors", path_with_namespace):
             log(f"Repo {path_with_namespace} already mirrored, skipping")
             continue
@@ -606,6 +612,217 @@ def migrate_protected_branches(legacy: GitLabAPI, new: GitLabAPI, cfg, state: St
 
 
 # ---------------------------------------------------------------------------
+# EXTRA STEPS: forks, labels, milestones, ssh_keys, snippets
+# ---------------------------------------------------------------------------
+
+def _enc(path):
+    return requests.utils.quote(path, safe="")
+
+
+def _all_as(api, path, sudo=None, params=None):
+    """Paginated GET, optionally impersonating a user with the Sudo header."""
+    out, page = [], 1
+    while True:
+        p = dict(params or {})
+        p.update(per_page=100, page=page)
+        r = api._req("GET", path, params=p, headers={"Sudo": sudo} if sudo else {})
+        if r.status_code != 200:
+            break
+        batch = r.json()
+        if not batch:
+            break
+        out.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    return out
+
+
+def migrate_forks(legacy, new, cfg, state, dry_run):
+    log("=== STEP: Forks ===")
+    work_dir = cfg["options"]["mirror_work_dir"]
+    for p in _scoped_projects(legacy, cfg):
+        up = p.get("forked_from_project")
+        if not up:
+            continue
+        path = p["path_with_namespace"]
+        if state.is_done("forks", path):
+            continue
+        if _new_project(new, path):
+            log(f"{path} already exists on new instance - not re-creating as a fork", "WARN")
+            state.mark("forks", path)
+            continue
+        upstream = _new_project(new, up["path_with_namespace"])
+        if not upstream:
+            log(f"Upstream {up['path_with_namespace']} missing on new - run projects/mirror first", "WARN")
+            continue
+        owner_ns = path.rsplit("/", 1)[0]
+        sudo = owner_ns if (p.get("namespace") or {}).get("kind") == "user" else None
+        if dry_run:
+            log(f"[DRY RUN] Would fork {up['path_with_namespace']} -> {path}")
+            continue
+        r = new._req("POST", f"/projects/{upstream['id']}/fork",
+                     headers={"Sudo": sudo} if sudo else {},
+                     data={"namespace_path": owner_ns, "name": p["name"], "path": p["path"]})
+        if r.status_code not in (200, 201):
+            log(f"Failed to fork into {path}: {r.text[:200]}", "ERROR")
+            continue
+        fid = r.json()["id"]
+        for _ in range(60):  # wait up to 5 min for the fork import to finish
+            st = new.get(f"/projects/{fid}") or {}
+            if st.get("import_status") in ("finished", "none", None):
+                break
+            time.sleep(5)
+        if _mirror_one(path, cfg["legacy"]["url"], cfg["legacy"]["token"],
+                       cfg["new"]["url"], cfg["new"]["token"], work_dir, False):
+            log(f"Created fork {path} (from {up['path_with_namespace']}) and mirrored its branches")
+            for cat in ("forks", "projects", "mirrors"):
+                state.mark(cat, path)
+
+
+def migrate_labels(legacy, new, cfg, state, dry_run):
+    log("=== STEP: Labels ===")
+    def copy(old_prefix, new_prefix, what):
+        have = {l["name"] for l in new.get_all(f"{new_prefix}/labels")}
+        for l in legacy.get_all(f"{old_prefix}/labels"):
+            if l["name"] in have:
+                continue
+            if dry_run:
+                log(f"[DRY RUN] Would create label '{l['name']}' on {what}")
+                continue
+            new.post(f"{new_prefix}/labels", data={
+                "name": l["name"], "color": l["color"], "description": l.get("description") or ""})
+    groups = legacy.get_all("/groups", params={"all_available": True})
+    groups.sort(key=lambda g: g["full_path"].count("/"))
+    for g in groups:
+        ng = new.get(f"/groups/{_enc(g['full_path'])}")
+        if ng:
+            copy(f"/groups/{g['id']}", f"/groups/{ng['id']}", g["full_path"])
+    for p in _scoped_projects(legacy, cfg):
+        np_ = _new_project(new, p["path_with_namespace"])
+        if np_:
+            copy(f"/projects/{p['id']}", f"/projects/{np_['id']}", p["path_with_namespace"])
+
+
+def migrate_milestones(legacy, new, cfg, state, dry_run):
+    log("=== STEP: Milestones ===")
+    def copy(old_prefix, new_prefix, what):
+        have = {m["title"] for m in new.get_all(f"{new_prefix}/milestones", params={"state": "all"})}
+        for m in legacy.get_all(f"{old_prefix}/milestones", params={"state": "all"}):
+            if m["title"] in have:
+                continue
+            if dry_run:
+                log(f"[DRY RUN] Would create milestone '{m['title']}' on {what}")
+                continue
+            data = {"title": m["title"], "description": m.get("description") or ""}
+            if m.get("due_date"):
+                data["due_date"] = m["due_date"]
+            if m.get("start_date"):
+                data["start_date"] = m["start_date"]
+            r = new.post(f"{new_prefix}/milestones", data=data)
+            if r.status_code == 201 and m.get("state") == "closed":
+                new.put(f"{new_prefix}/milestones/{r.json()['id']}", data={"state_event": "close"})
+    groups = legacy.get_all("/groups", params={"all_available": True})
+    groups.sort(key=lambda g: g["full_path"].count("/"))
+    for g in groups:
+        ng = new.get(f"/groups/{_enc(g['full_path'])}")
+        if ng:
+            copy(f"/groups/{g['id']}", f"/groups/{ng['id']}", g["full_path"])
+    for p in _scoped_projects(legacy, cfg):
+        np_ = _new_project(new, p["path_with_namespace"])
+        if np_:
+            copy(f"/projects/{p['id']}", f"/projects/{np_['id']}", p["path_with_namespace"])
+
+
+def migrate_ssh_keys(legacy, new, cfg, state, dry_run):
+    log("=== STEP: SSH keys ===")
+    skiplist = set(cfg["options"].get("user_skiplist", []) or cfg.get("user_skiplist", []))
+    body = lambda k: (k.split() + [""])[1] if len(k.split()) > 1 else k
+    for u in legacy.get_all("/users"):
+        if u["username"] in skiplist:
+            continue
+        keys = legacy.get_all(f"/users/{u['id']}/keys")
+        if not keys:
+            continue
+        nu = new.get_all("/users", params={"username": u["username"]})
+        if not nu:
+            log(f"User {u['username']} missing on new - run users step first", "WARN")
+            continue
+        uid = nu[0]["id"]
+        have = {body(k["key"]) for k in new.get_all(f"/users/{uid}/keys")}
+        for k in keys:
+            if body(k["key"]) in have:
+                continue
+            if dry_run:
+                log(f"[DRY RUN] Would add SSH key '{k['title']}' for {u['username']}")
+                continue
+            data = {"title": k["title"], "key": k["key"]}
+            if k.get("expires_at"):
+                data["expires_at"] = k["expires_at"]
+            r = new.post(f"/users/{uid}/keys", data=data)
+            if r.status_code == 201:
+                log(f"Added SSH key '{k['title']}' for {u['username']}")
+            else:
+                log(f"Failed SSH key '{k['title']}' for {u['username']}: {r.text[:150]}", "ERROR")
+
+
+def migrate_snippets(legacy, new, cfg, state, dry_run):
+    log("=== STEP: Snippets ===")
+    skiplist = set(cfg["options"].get("user_skiplist", []) or cfg.get("user_skiplist", []))
+    files = lambda s, content: [{"file_path": s.get("file_name") or "snippet.txt", "content": content}]
+    # personal snippets: list each user's own snippets by impersonating them
+    for u in legacy.get_all("/users"):
+        name = u["username"]
+        if name in skiplist:
+            continue
+        for s in _all_as(legacy, "/snippets", sudo=name):
+            key = f"personal:{name}:{s['id']}"
+            if state.is_done("snippets", key):
+                continue
+            if dry_run:
+                log(f"[DRY RUN] Would copy personal snippet '{s['title']}' of {name}")
+                continue
+            raw = legacy._req("GET", f"/snippets/{s['id']}/raw", headers={"Sudo": name})
+            if raw.status_code != 200:
+                continue
+            r = new._req("POST", "/snippets", headers={"Sudo": name}, json={
+                "title": s["title"], "description": s.get("description") or "",
+                "visibility": s.get("visibility", "private"), "files": files(s, raw.text)})
+            if r.status_code == 201:
+                log(f"Copied personal snippet '{s['title']}' of {name}")
+                state.mark("snippets", key)
+            else:
+                log(f"Failed personal snippet '{s['title']}' of {name}: {r.text[:150]}", "ERROR")
+    # project snippets
+    for p in _scoped_projects(legacy, cfg):
+        np_ = _new_project(new, p["path_with_namespace"])
+        if not np_:
+            continue
+        for s in legacy.get_all(f"/projects/{p['id']}/snippets"):
+            key = f"project:{p['path_with_namespace']}:{s['id']}"
+            if state.is_done("snippets", key):
+                continue
+            if dry_run:
+                log(f"[DRY RUN] Would copy project snippet '{s['title']}' in {p['path_with_namespace']}")
+                continue
+            raw = legacy._req("GET", f"/projects/{p['id']}/snippets/{s['id']}/raw")
+            if raw.status_code != 200:
+                continue
+            body = {"title": s["title"], "description": s.get("description") or "",
+                    "visibility": s.get("visibility", "private"), "files": files(s, raw.text)}
+            author = (s.get("author") or {}).get("username")
+            r = new._req("POST", f"/projects/{np_['id']}/snippets",
+                         headers={"Sudo": author} if author else {}, json=body)
+            if r.status_code != 201:
+                r = new._req("POST", f"/projects/{np_['id']}/snippets", json=body)
+            if r.status_code == 201:
+                log(f"Copied project snippet '{s['title']}' in {p['path_with_namespace']}")
+                state.mark("snippets", key)
+            else:
+                log(f"Failed project snippet '{s['title']}': {r.text[:150]}", "ERROR")
+
+
+# ---------------------------------------------------------------------------
 # MAIN
 # ---------------------------------------------------------------------------
 
@@ -615,12 +832,18 @@ STEP_FUNCS = {
     "membership": migrate_membership,
     "projects": migrate_projects,
     "mirror": migrate_mirror,
+    "forks": migrate_forks,
     "project_members": migrate_project_members,
+    "labels": migrate_labels,
+    "milestones": migrate_milestones,
     "webhooks": migrate_webhooks,
     "protected_branches": migrate_protected_branches,
+    "ssh_keys": migrate_ssh_keys,
+    "snippets": migrate_snippets,
 }
-STEP_ORDER = ["users", "groups", "membership", "projects", "mirror",
-              "project_members", "webhooks", "protected_branches"]
+STEP_ORDER = ["users", "groups", "membership", "projects", "mirror", "forks",
+              "project_members", "labels", "milestones", "webhooks",
+              "protected_branches", "ssh_keys", "snippets"]
 
 
 def main():
