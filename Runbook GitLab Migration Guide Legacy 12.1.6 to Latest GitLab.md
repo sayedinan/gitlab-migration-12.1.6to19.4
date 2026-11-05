@@ -2,7 +2,7 @@
 
 A complete, copy-and-paste guide to migrating users, groups, repositories, and issue and merge request history from a legacy GitLab CE 12.1.6 instance to a current GitLab. It was written from a full rehearsal and includes the mistakes that were made along the way, so you can avoid them. Follow the steps in order, and do not skip the dry runs.
 
-**About the scripts:** this guide assumes the patched package (version 2). Besides the original steps it adds forks, labels, milestones, SSH keys and snippets to Part A, copies labels and milestones onto issues and merge requests and recreates merge requests whose source branch was deleted in Part B, and has a validator that checks all of it. If you use the original package, treat those items as manual work (section 10.2) and expect fewer merge requests on the new instance.
+**About the scripts:** this guide assumes the patched package (version 2). Besides the original steps it adds forks, labels, milestones, SSH keys and snippets to Part A, copies labels and milestones onto issues and merge requests and recreates merge requests whose source branch was deleted in Part B, and has a validator that checks all of it. It also adds `block.py`, a separate final step that blocks on the new instance the users who are blocked on legacy (section 10.5). If you use the original package, treat those items as manual work (section 10.2) and expect fewer merge requests on the new instance.
 
 ## 1. Read this first
 
@@ -13,6 +13,7 @@ A complete, copy-and-paste guide to migrating users, groups, repositories, and i
 - **Validation (`validate_migration.py`):** compares legacy and new for users, groups, projects, issue counts, MR counts, commit counts, comments, labels, milestones, snippets, SSH keys and fork links.
 - **Wiki migration (`migrate_wikis.py`, Python, run separately):** copies each project's wiki with its full page history and authors (section 10.4).
 - **Link fix (`fix_links.py` and `fix_links_metadata.rb`, run last):** replaces addresses of the legacy server that are written inside READMEs, docs, issues and comments, so links on the new instance stay on the new instance (section 10.3).
+- **Block users (`block.py`, Python, run last):** finds the users that are blocked on legacy and blocks the same users on the new instance (section 10.5). Part A creates every user as active, so this step is what carries the blocked state over.
 
 ### Why a custom path was needed
 
@@ -25,6 +26,7 @@ GitLab's built-in project export/import does not work between 12.1.6 and a curre
 - Issue and MR attachments (`/uploads/...` links in migrated text will be broken).
 - Deploy keys and protected tags. Wikis are copied only by the separate migrate\_wikis.py script (section 10.4).
 - Links written as full legacy addresses (for example `http://180.210.129.233:8090/...`) inside READMEs, docs, issues and comments are copied unchanged and lead back to legacy until the link fix in section 10.3 is run.
+- The blocked state of users. Part A creates every user as active; `block.py` (section 10.5) blocks them at the very end.
 - CI runners and pipeline history (confirmed out of scope).
 - Container registry images (the rehearsal legacy had no registry, so check the real one in Step 4).
 - Original creation dates of snippets and SSH keys (the API cannot set them), and system-generated activity notes on issues and MRs (real comments are migrated).
@@ -37,6 +39,7 @@ GitLab's built-in project export/import does not work between 12.1.6 and a curre
 3. **Never delete data through the web UI and then re-run.** The scripts trust their own state files, not the database (see section 12).
 4. **Nothing in this process changes the legacy server.** It is only read, so legacy stays usable as a fallback.
 5. **Do not press Ctrl+C or Ctrl+Z on a running migration.** `gitlab-rails runner` takes 1 to 3 minutes to boot with no output, which is normal.
+6. **Block users last.** Run `block.py` (section 10.5) only after Part A, Part B, the wikis, validation and the link fix are finished. A blocked user can make steps that act on their behalf fail (for example their snippets).
 
 ## 2. The two servers and what runs where
 
@@ -182,7 +185,7 @@ cd real_migration
 ls
 ```
 
-You should see `config.yaml`, `migrate_gitlab.py`, `migrate_metadata.rb`, `validate_migration.py`, `sync_delta.py`, and `REAL_MIGRATION_RUNBOOK.md`. If `unzip` is missing, run `sudo apt install unzip`.
+You should see `config.yaml`, `migrate_gitlab.py`, `migrate_metadata.rb`, `validate_migration.py`, `sync_delta.py`, `block.py`, and `REAL_MIGRATION_RUNBOOK.md`. If `unzip` is missing, run `sudo apt install unzip`.
 
 ## 7. Install dependencies and fill in the configuration
 
@@ -403,7 +406,8 @@ If a check fails, the output shows the numbers (for example `legacy=12 new=11`).
 ### 10.2 Manual follow-up work
 
 - Re-enter the secret token of every webhook. Also point each webhook at the new server if it still targets legacy.
-- Ask every user to log in with the temporary password (`ChangeMe123!` unless you changed it), set a new password, re-enable 2FA, and re-add any SSH key the migration log reported as failed.
+- Block the users who are blocked on legacy with section 10.5, as the very last step.
+- Ask every user (except those who are blocked on legacy) to log in with the temporary password (`ChangeMe123!` unless you changed it), set a new password, re-enable 2FA, and re-add any SSH key the migration log reported as failed.
 - Recreate deploy keys and protected tags if you need them. Copy the wikis with section 10.4.
 - Run the link fix (section 10.3) as the last data step, after any final sync.
 - Update team documentation, CI settings, and any `git remote` URLs (`git remote set-url origin <new url>`).
@@ -491,6 +495,35 @@ Copy one project first and open its Wiki on the new instance before running the 
 - Files uploaded through the wiki editor come across with the repository. Images pasted into issue and merge request text do not (section 1).
 - Migrated pages still contain legacy links. Fix them with `python3 fix_links.py --wikis-only --apply` (section 10.3), which updates changed pages one commit at a time. It can run any time after the wikis are copied, and again after a re-copy.
 
+### 10.5 Block users that are blocked on legacy
+
+The GitLab API cannot create a user as blocked, so Part A creates every user as active, including the ones that are blocked on legacy. `block.py` fixes that. It reads all users on legacy, and for each one whose state is blocked it blocks the same username on the new instance.
+
+**Run it last**: after Part A, Part B, the wikis, validation and the link fix (and after any final sync, section 11). Blocking earlier can make other steps fail, because steps that act on behalf of a user do not work for a blocked user (a personal snippet owned by a blocked user fails, for example).
+
+**What blocking does and does not do.** Blocking only stops the user from signing in. Their commits, issues, merge requests, comments, wiki history and project and group memberships stay exactly as migrated. Do not put blocked users in `user_skiplist` to get the same effect: a skipped user does not exist on the new instance, so Part B drops their issues (`Author ... not found ... skipping`).
+
+Run it on the new server, from `~/real_migration`. It uses the same `config.yaml` as Part A (URLs, tokens, `user_skiplist` and `options.dry_run`):
+
+```bash
+cd ~/real_migration
+python3 block.py --dry-run        # review: expect "[DRY RUN] Would block user <name> to match source"
+grep dry_run config.yaml          # must say false for the real run
+python3 block.py                  # real run
+```
+
+Good output is one `Blocked user <name> to match source` line per blocked legacy user, then a summary line such as `Summary: blocked=1, already blocked=0, missing on new=0, skipped=0, failed=0`, and `Done.`
+
+**Things to know**
+
+- It never unblocks anyone. If a user is blocked on the new instance but active on legacy, it only prints a `NOTE` line, so you can decide by hand.
+- It skips users in `user_skiplist` and the account that owns the new-instance token, so it cannot lock you out.
+- A user who is blocked on legacy but missing on the new instance is reported as a warning and not touched. Run the `users` step of Part A first.
+- It is safe to run again. Users that are already blocked are left alone. Run it again after every sync pass (section 11), because new users brought over by a sync are created active.
+- Progress is not stored in a state file. It compares legacy and new each time, so there is nothing to reset.
+
+**Check it worked:** in the new Admin Area, open Users and the **Blocked** tab. It must list the same users as the Blocked tab on legacy.
+
 ## 11. If legacy is still being used after the migration
 
 Nothing syncs automatically. To catch up on changes made on legacy (new users, groups, projects, and commits or branches in projects already mirrored):
@@ -509,7 +542,9 @@ For new issues, MRs, and comments, simply run Part B again (section 9.5). It is 
 
 If you have already run the link fix (section 10.3), run it again after every sync pass. A re-mirror removes the link-fix commit, and new issues brought in by Part B still carry legacy links.
 
-A good cutover plan: freeze legacy (stop pushes), do a final sync pass, validate, run the link fix (section 10.3), then switch users over.
+If new users were brought over by the sync, or a user was blocked on legacy after the first run, run `block.py` again (section 10.5) as the last step.
+
+A good cutover plan: freeze legacy (stop pushes), do a final sync pass, validate, run the link fix (section 10.3), run `block.py` (section 10.5), then switch users over.
 
 ## 12. Redoing or undoing a run safely
 
@@ -593,7 +628,11 @@ Nothing touches legacy. To roll back, simply stop using the new instance (or del
 - **A few merge requests are missing:** the target branch is missing on the new instance, or the recovery step could not find a usable commit. Branches deleted on legacy are normally recreated temporarily, so a missing merge request now needs investigation: search the Part B log for the MR's number.
 - **One-off `500 Internal Server Error` from the legacy API:** retry; if it persists for one item, fix that item by hand.
 - **`Failed SSH key ...` in Part A:** the key already belongs to another account, is too short, or is a type the new server does not allow. Ask that user to add a new key.
-- **`Failed personal snippet ...`:** the owner is blocked or missing on the new instance (Sudo fails for blocked users). Recreate the snippet by hand.
+- **`Failed personal snippet ...`:** the owner is blocked or missing on the new instance (Sudo fails for blocked users). Recreate the snippet by hand. Run `block.py` only after Part A, so this does not happen (section 10.5).
+- **`... is blocked on legacy but missing on new instance` in `block.py`:** that user was never created on the new instance (skiplist, or the `users` step failed). Run `python3 migrate_gitlab.py --steps users`, then run `block.py` again.
+- **`Failed to block user ...` in `block.py`:** the new-instance token is not an admin token with `api` scope, or the URL in `config.yaml` is wrong. Test the token as in Step 5.
+- **`NOTE: ... is blocked on new but ACTIVE on legacy`:** information only. Someone blocked that user on the new instance by hand. Unblock them in the Admin Area if that was not intended; `block.py` never unblocks.
+- **A user blocked on legacy can still log in on the new instance:** `block.py` has not been run for real yet (check `options.dry_run` in `config.yaml`), or it ran before that user was created. Run it again.
 - **`Upstream ... missing on new` in the forks step:** the upstream project has not been created and mirrored yet. Run the `projects` and `mirror` steps first, then `--steps forks`.
 - **Issues have no labels or milestones on new:** the `labels` and `milestones` steps ran after Part B. Run them, then redo Part B (section 12).
 - **Validator shows `Comments`, `Milestones` or `Snippets` mismatches:** read the numbers in the detail text, run the matching Part A step again (they are safe to repeat), and redo Part B if the difference is in comments.
@@ -620,6 +659,7 @@ Tick each item before declaring the migration done.
 - [ ] Legacy kept intact until the team signs off, and a final sync done if legacy was still in use.
 - [ ] Wikis copied (section 10.4) and `migrate_wikis.py --verify` shows every project matching.
 - [ ] Link fix (section 10.3) dry run reviewed, then applied as the last step; a README link on the new instance stays on the new server.
+- [ ] `block.py` dry run reviewed, then applied as the final step; the Blocked tab on the new instance matches legacy (section 10.5).
 - [ ] Migration tokens revoked.
 - [ ] The extra steps (forks, labels, milestones, SSH keys, snippets) ran, and the validator's extras section passes.
 
@@ -662,4 +702,11 @@ python3 fix_links.py --apply
 cp fix_links_metadata.rb /tmp/ && chmod 644 /tmp/fix_links_metadata.rb
 sudo LEGACY_BASES="$LEGACY_BASES" NEW_BASE="$GITLAB_NEW_URL" gitlab-rails runner /tmp/fix_links_metadata.rb              # dry run
 sudo LEGACY_BASES="$LEGACY_BASES" NEW_BASE="$GITLAB_NEW_URL" APPLY=1 gitlab-rails runner /tmp/fix_links_metadata.rb      # real run
+```
+
+Block users that are blocked on legacy, after everything else (section 10.5):
+
+```bash
+python3 block.py --dry-run
+python3 block.py                     # set dry_run: false in config.yaml first
 ```
