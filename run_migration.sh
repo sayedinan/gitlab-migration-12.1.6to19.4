@@ -65,6 +65,22 @@ api_check() {
   esac
 }
 
+# read_secret VAR "prompt": like read -s, but shows one * per character typed
+read_secret() {
+  local __var="$1" __prompt="$2" __c __s=""
+  printf '%s' "$__prompt" >&2
+  while IFS= read -r -s -n1 __c; do
+    [ -z "$__c" ] && break                       # Enter
+    if [ "$__c" = $'\x7f' ] || [ "$__c" = $'\b' ]; then   # Backspace
+      if [ -n "$__s" ]; then __s="${__s%?}"; printf '\b \b' >&2; fi
+    else
+      __s+="$__c"; printf '*' >&2
+    fi
+  done
+  printf '\n' >&2
+  printf -v "$__var" '%s' "$__s"
+}
+
 # --------------------------------------------------------------------------
 # start (foreground part): ask, check, hand over to the background runner
 # --------------------------------------------------------------------------
@@ -95,10 +111,10 @@ cmd_start() {
   echo
   local L_URL L_TOK N_URL N_TOK SUDO_PW
   read -r  -p "Legacy GitLab URL (e.g. http://host:8090): " L_URL
-  read -r -s -p "Legacy GitLab admin token (hidden): "      L_TOK; echo
+  read_secret L_TOK "Legacy GitLab admin token: "
   read -r  -p "New GitLab URL (e.g. http://host): "          N_URL
-  read -r -s -p "New GitLab admin token (hidden): "          N_TOK; echo
-  read -r -s -p "sudo password for $(id -un) (hidden): "     SUDO_PW; echo
+  read_secret N_TOK "New GitLab admin token: "
+  read_secret SUDO_PW "sudo password for $(id -un): "
   L_URL="${L_URL%/}"; N_URL="${N_URL%/}"
   [[ "$L_URL" =~ ^https?:// ]] || die "legacy URL must start with http:// or https://"
   [[ "$N_URL" =~ ^https?:// ]] || die "new URL must start with http:// or https://"
