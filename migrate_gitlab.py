@@ -119,6 +119,23 @@ def load_config(path="config.yaml"):
 # STEP 1: USERS
 # ---------------------------------------------------------------------------
 
+def block_if_needed(new, legacy_user, new_user_id, dry_run):
+    """Mirror the legacy 'blocked' state onto the new instance."""
+    if legacy_user.get("state") != "blocked":
+        return
+    username = legacy_user["username"]
+    if dry_run:
+        log(f"[DRY RUN] Would block user {username} to match source")
+        return
+    r = new.post(f"/users/{new_user_id}/block")
+    if r.status_code in (200, 201):
+        log(f"Blocked user {username} to match source")
+    elif r.status_code == 403:
+        log(f"User {username} already blocked")
+    else:
+        log(f"Failed to block user {username}: {r.text[:200]}", "ERROR")
+
+
 def migrate_users(legacy: GitLabAPI, new: GitLabAPI, cfg, state: State, dry_run):
     log("=== STEP 1: Users ===")
     skiplist = set(cfg["options"].get("user_skiplist", []) or cfg.get("user_skiplist", []))
@@ -143,6 +160,7 @@ def migrate_users(legacy: GitLabAPI, new: GitLabAPI, cfg, state: State, dry_run)
 
         if dry_run:
             log(f"[DRY RUN] Would create user: {username} ({u.get('email', 'no-email')})")
+            block_if_needed(new, u, None, dry_run)
             continue
 
         is_admin = bool(u.get("is_admin"))
@@ -158,8 +176,17 @@ def migrate_users(legacy: GitLabAPI, new: GitLabAPI, cfg, state: State, dry_run)
         if resp.status_code == 201:
             log(f"Created user {username}" + (" (ADMIN)" if is_admin else ""))
             state.mark("users", username)
+            block_if_needed(new, u, resp.json()["id"], dry_run)
         else:
             log(f"Failed to create user {username}: {resp.text[:200]}", "ERROR")
+
+    # Reconcile: blocked on legacy but active on new (covers reruns / existing users)
+    for u in users:
+        if u["username"] in skiplist or u.get("state") != "blocked":
+            continue
+        found = new.get_all("/users", params={"username": u["username"]})
+        if found and found[0].get("state") == "active":
+            block_if_needed(new, u, found[0]["id"], dry_run)
 
 
 # ---------------------------------------------------------------------------
